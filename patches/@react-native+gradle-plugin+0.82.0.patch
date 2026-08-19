@@ -1,0 +1,112 @@
+diff --git a/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/ReactPlugin.kt b/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/ReactPlugin.kt
+index 890e61c..b51e5ca 100644
+--- a/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/ReactPlugin.kt
++++ b/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/ReactPlugin.kt
+@@ -95,12 +95,26 @@ class ReactPlugin : Plugin<Project> {
+       configureCodegen(project, extension, rootExtension, isLibrary = false)
+       configureResources(project, extension)
+       configureBuildTypesForApp(project)
++
++      // AGP 9 backport of https://github.com/facebook/react-native/pull/57038: apply the
++      // namespace fallback to every Android library in the build, including third-party
++      // libraries that don't apply `com.facebook.react` and still rely on the manifest
++      // `package` attribute. Swept once, from the application project, and only for
++      // projects that haven't been evaluated yet — registering `finalizeDsl` on an
++      // already-evaluated project is a hard error on AGP 9.
++      project.rootProject.allprojects { subproject ->
++        subproject.pluginManager.withPlugin("com.android.library") {
++          if (!subproject.state.executed) {
++            configureNamespaceForLibraries(subproject)
++          }
++        }
++      }
+     }
+ 
+     // Library Only Configuration
+-    configureBuildConfigFieldsForLibraries(project)
+-    configureNamespaceForLibraries(project)
+     project.pluginManager.withPlugin("com.android.library") {
++      configureBuildConfigFieldsForLibraries(project)
++      configureNamespaceForLibraries(project)
+       configureCodegen(project, extension, rootExtension, isLibrary = true)
+     }
+   }
+diff --git a/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/utils/AgpConfiguratorUtils.kt b/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/utils/AgpConfiguratorUtils.kt
+index ab011c2..2fa9515 100644
+--- a/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/utils/AgpConfiguratorUtils.kt
++++ b/node_modules/@react-native/gradle-plugin/react-native-gradle-plugin/src/main/kotlin/com/facebook/react/utils/AgpConfiguratorUtils.kt
+@@ -81,13 +81,14 @@ internal object AgpConfiguratorUtils {
+     project.pluginManager.withPlugin("com.android.library", action)
+   }
+ 
+-  fun configureBuildConfigFieldsForLibraries(appProject: Project) {
+-    appProject.rootProject.allprojects { subproject ->
+-      subproject.pluginManager.withPlugin("com.android.library") {
+-        subproject.extensions
+-            .getByType(LibraryAndroidComponentsExtension::class.java)
+-            .finalizeDsl { ext -> ext.buildFeatures.buildConfig = true }
+-      }
++  fun configureBuildConfigFieldsForLibraries(project: Project) {
++    // AGP 9 backport of https://github.com/facebook/react-native/pull/57038: only
++    // configure the project this plugin is applied to. Sweeping
++    // rootProject.allprojects hits projects whose DSL is already finalized, which
++    // AGP 9 rejects ("too late to call finalizeDsl").
++    project.extensions.getByType(LibraryAndroidComponentsExtension::class.java).finalizeDsl { ext
++      ->
++      ext.buildFeatures.buildConfig = true
+     }
+   }
+ 
+@@ -113,23 +114,26 @@ internal object AgpConfiguratorUtils {
+     project.pluginManager.withPlugin("com.android.library", action)
+   }
+ 
+-  fun configureNamespaceForLibraries(appProject: Project) {
+-    appProject.rootProject.allprojects { subproject ->
+-      subproject.pluginManager.withPlugin("com.android.library") {
+-        subproject.extensions
+-            .getByType(LibraryAndroidComponentsExtension::class.java)
+-            .finalizeDsl { ext ->
+-              if (ext.namespace == null) {
+-                val android = subproject.extensions.getByType(LibraryExtension::class.java)
+-                val manifestFile = android.sourceSets.getByName("main").manifest.srcFile
+-
+-                manifestFile
+-                    .takeIf { it.exists() }
+-                    ?.let { file ->
+-                      getPackageNameFromManifest(file)?.let { packageName ->
+-                        ext.namespace = packageName
+-                      }
+-                    }
++  fun configureNamespaceForLibraries(project: Project) {
++    // AGP 9 backport of https://github.com/facebook/react-native/pull/57038.
++    // This helper can be reached both from a library's own application of the React plugin and
++    // from the app-level sweep in ReactPlugin (which also covers libraries that don't apply
++    // `com.facebook.react`). A project's `finalizeDsl` callback must be registered before AGP
++    // finalizes its DSL — registering it twice (or after finalization) is a hard error on AGP 9+ —
++    // so we guard to register the namespace fallback at most once per project.
++    if (project.extensions.extraProperties.has(NAMESPACE_CONFIGURED_PROPERTY)) {
++      return
++    }
++    project.extensions.extraProperties.set(NAMESPACE_CONFIGURED_PROPERTY, true)
++    project.extensions.getByType(LibraryAndroidComponentsExtension::class.java).finalizeDsl { ext ->
++      if (ext.namespace == null) {
++        val manifestFile =
++            project.layout.projectDirectory.file("src/main/AndroidManifest.xml").asFile
++        manifestFile
++            .takeIf { it.exists() }
++            ?.let { file ->
++              getPackageNameFromManifest(file)?.let { packageName ->
++                ext.namespace = packageName
+               }
+             }
+       }
+@@ -137,6 +141,8 @@ internal object AgpConfiguratorUtils {
+   }
+ }
+ 
++private const val NAMESPACE_CONFIGURED_PROPERTY = "com.facebook.react.internal.namespaceConfigured"
++
+ const val DEFAULT_DEV_SERVER_PORT = "8081"
+ 
+ fun getPackageNameFromManifest(manifest: File): String? {
