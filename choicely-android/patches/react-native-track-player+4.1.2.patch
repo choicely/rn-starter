@@ -410,3 +410,58 @@ index b2409a0..fee72e1 100644
 -    }
 +    } }
  }
+diff --git a/node_modules/react-native-track-player/android/src/main/java/com/doublesymmetry/trackplayer/service/MusicService.kt b/node_modules/react-native-track-player/android/src/main/java/com/doublesymmetry/trackplayer/service/MusicService.kt
+index afa6b0f..336ab40 100644
+--- a/node_modules/react-native-track-player/android/src/main/java/com/doublesymmetry/trackplayer/service/MusicService.kt
++++ b/node_modules/react-native-track-player/android/src/main/java/com/doublesymmetry/trackplayer/service/MusicService.kt
+@@ -94,6 +94,14 @@ class MusicService : HeadlessJsTaskService() {
+     private var compactCapabilities: List<Capability> = emptyList()
+ 
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        // A null intent is Android restarting this sticky service after the process died.
++        // The player and its queue died with the process, so there is nothing to resume, and
++        // from the background Android 12+ refuses the startForeground below: the app would
++        // crash again on every restart ("keeps stopping").
++        if (intent == null) {
++            stopSelf(startId)
++            return START_NOT_STICKY
++        }
+         startTask(getTaskConfig(intent))
+         startAndStopEmptyNotificationToAvoidANR()
+         return START_STICKY
+@@ -120,7 +128,14 @@ class MusicService : HeadlessJsTaskService() {
+             notificationBuilder.foregroundServiceBehavior = NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE
+         }
+         val notification = notificationBuilder.build()
+-        startForeground(EMPTY_NOTIFICATION_ID, notification)
++        try {
++            startForeground(EMPTY_NOTIFICATION_ID, notification)
++        } catch (e: IllegalStateException) {
++            // ForegroundServiceStartNotAllowedException (Android 12+) when started from the
++            // background. The service still runs; it only cannot show the placeholder.
++            Timber.w(e, "could not start the placeholder foreground notification")
++            return
++        }
+         @Suppress("DEPRECATION")
+         stopForeground(true)
+     }
+@@ -741,7 +756,9 @@ class MusicService : HeadlessJsTaskService() {
+ 
+     @MainThread
+     private fun emit(event: String, data: Bundle? = null) {
+-        reactNativeHost.reactInstanceManager.currentReactContext
++        // HeadlessJsTaskService.reactContext reads the ReactHost on the New Architecture.
++        // reactNativeHost.reactInstanceManager throws there ("createReactContext is unsupported").
++        reactContext
+             ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+             ?.emit(event, data?.let { Arguments.fromBundle(it) })
+     }
+@@ -751,7 +768,7 @@ class MusicService : HeadlessJsTaskService() {
+         val payload = Arguments.createArray()
+         data.forEach { payload.pushMap(Arguments.fromBundle(it)) }
+ 
+-        reactNativeHost.reactInstanceManager.currentReactContext
++        reactContext
+             ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+             ?.emit(event, payload)
+     }

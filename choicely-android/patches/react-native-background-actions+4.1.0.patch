@@ -1,0 +1,191 @@
+diff --git a/node_modules/react-native-background-actions/android/src/main/AndroidManifest.xml b/node_modules/react-native-background-actions/android/src/main/AndroidManifest.xml
+--- a/node_modules/react-native-background-actions/android/src/main/AndroidManifest.xml
++++ b/node_modules/react-native-background-actions/android/src/main/AndroidManifest.xml
+@@ -1,6 +1,11 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.asterinet.react.bgactions">
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <application>
+-        <service android:name=".RNBackgroundActionsTask"/>
++        <!-- Choicely patch: Android 14+ needs a type. shortService needs no extra permission or
++             Play Console declaration, but the system stops it after about 3 minutes (onTimeout). -->
++        <service
++            android:name=".RNBackgroundActionsTask"
++            android:exported="false"
++            android:foregroundServiceType="shortService" />
+     </application>
+ </manifest>
+diff --git a/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/BackgroundActionsModule.java b/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/BackgroundActionsModule.java
+--- a/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/BackgroundActionsModule.java
++++ b/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/BackgroundActionsModule.java
+@@ -70,6 +70,12 @@ public class BackgroundActionsModule extends ReactContextBaseJavaModule {
+     @SuppressWarnings("unused")
+     @ReactMethod
+     public void updateNotification(@NonNull final ReadableMap options, @NonNull final Promise promise) {
++        // Choicely patch: after a timeout or stop() there is no service behind the ongoing
++        // notification; posting it again would leave a stuck notification. Do nothing then.
++        if (!RNBackgroundActionsTask.isInForeground()) {
++            promise.resolve(null);
++            return;
++        }
+         // Get the task info from the options
+         try {
+             final BackgroundTaskOptions bgOptions = new BackgroundTaskOptions(reactContext, options);
+diff --git a/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/RNBackgroundActionsTask.java b/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/RNBackgroundActionsTask.java
+--- a/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/RNBackgroundActionsTask.java
++++ b/node_modules/react-native-background-actions/android/src/main/java/com/asterinet/react/bgactions/RNBackgroundActionsTask.java
+@@ -5,11 +5,15 @@ import android.app.Notification;
+ import android.app.NotificationChannel;
+ import android.app.NotificationManager;
+ import android.app.PendingIntent;
++import android.content.ComponentName;
+ import android.content.Context;
+ import android.content.Intent;
++import android.content.pm.PackageManager;
++import android.content.pm.ServiceInfo;
+ import android.net.Uri;
+ import android.os.Build;
+ import android.os.Bundle;
++import android.util.Log;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -18,12 +22,24 @@ import androidx.core.app.ServiceCompat;
+ 
+ import com.facebook.react.HeadlessJsTaskService;
+ import com.facebook.react.bridge.Arguments;
++import com.facebook.react.bridge.ReactContext;
++import com.facebook.react.modules.core.DeviceEventManagerModule;
+ import com.facebook.react.jstasks.HeadlessJsTaskConfig;
+ 
+ final public class RNBackgroundActionsTask extends HeadlessJsTaskService {
+ 
+     public static final int SERVICE_NOTIFICATION_ID = 92901;
+     private static final String CHANNEL_ID = "RN_BACKGROUND_ACTIONS_CHANNEL";
++    private static final String TAG = "RNBackgroundActions";
++    private boolean stoppingOnTimeout;
++    // Choicely patch: the instance currently in the foreground, so updateNotification cannot
++    // re-post the ongoing notification after the service stopped (timeout or stop()).
++    @Nullable
++    private static volatile RNBackgroundActionsTask foregroundInstance;
++
++    public static boolean isInForeground() {
++        return foregroundInstance != null;
++    }
+ 
+     @SuppressLint("UnspecifiedImmutableFlag")
+     @NonNull
+@@ -102,30 +118,110 @@ final public class RNBackgroundActionsTask extends HeadlessJsTaskService {
+                 this,
+                 SERVICE_NOTIFICATION_ID,
+                 notification,
+-                bgOptions.getForegroundServiceType()
++                resolveForegroundServiceType(bgOptions.getForegroundServiceType())
+             );
+         } catch (RuntimeException e) {
+             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                     && e instanceof android.app.ForegroundServiceStartNotAllowedException) {
+-                // Android 12+: not allowed to start foreground service from background
++                // Android 12+: not allowed to start foreground service from background.
++                // Choicely patch: tell JS ('expiration') so isRunning() does not stay true.
++                Log.w(TAG, "Foreground service not allowed to start", e);
++                emitExpiration();
+                 stopSelf(startId);
+                 return START_NOT_STICKY;
+             }
++            // Anything else, including the Android 14+ foreground-service type exceptions, is a
++            // build configuration error (the manifest type is resolved above): fail loudly.
+             throw e;
+         }
++        foregroundInstance = this;
+         return super.onStartCommand(intent, flags, startId);
+     }
+ 
++    /**
++     * Choicely patch: the type JS asked for, limited to the types this service declares in the
++     * merged manifest; when JS asks for none (or only undeclared ones), the manifest's types.
++     * Android 14+ rejects type 0 and any type the manifest does not declare.
++     */
++    private int resolveForegroundServiceType(final int requested) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
++            return 0;
++        }
++        int declared;
++        try {
++            declared = getPackageManager()
++                    .getServiceInfo(new ComponentName(this, RNBackgroundActionsTask.class), 0)
++                    .getForegroundServiceType();
++        } catch (PackageManager.NameNotFoundException e) {
++            declared = ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST;
++        }
++        if (declared == ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST) {
++            return requested != 0 ? requested : ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST;
++        }
++        final int allowed = requested & declared;
++        if (allowed != 0) {
++            return allowed;
++        }
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
++            // Below Android 14 a type is optional and shortService does not exist yet.
++            return 0;
++        }
++        return declared;
++    }
++
++    // Choicely patch: shortService gets about 3 minutes, then onTimeout. The service must stop
++    // within a few seconds or the app gets an ANR / crash, so stop at once and tell JS
++    // ('expiration', the same event iOS sends) so the task can wrap up.
+     @Override
+     public void onTimeout(int startId) {
+         super.onTimeout(startId);
+-        stopSelf(startId);
++        stopOnTimeout();
+     }
+ 
+     @Override
+     public void onTimeout(int startId, int fgsType) {
+         super.onTimeout(startId, fgsType);
+-        stopSelf(startId);
++        stopOnTimeout();
++    }
++
++    private void stopOnTimeout() {
++        // Android 15+ calls both onTimeout overloads for one timeout.
++        if (stoppingOnTimeout) {
++            return;
++        }
++        stoppingOnTimeout = true;
++        Log.w(TAG, "Foreground service timed out; stopping");
++        clearForegroundInstance();
++        // JS gets the event first, but the service stops at once: JS must not rely on still
++        // having the foreground service while it handles 'expiration'.
++        emitExpiration();
++        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE);
++        stopSelf();
++    }
++
++    @Override
++    public void onDestroy() {
++        clearForegroundInstance();
++        super.onDestroy();
++    }
++
++    private void clearForegroundInstance() {
++        if (foregroundInstance == this) {
++            foregroundInstance = null;
++        }
++    }
++
++    private void emitExpiration() {
++        try {
++            final ReactContext reactContext = getReactContext();
++            if (reactContext != null && reactContext.hasActiveReactInstance()) {
++                reactContext
++                        .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
++                        .emit("expiration", null);
++            }
++        } catch (RuntimeException e) {
++            Log.w(TAG, "Could not send expiration to JS", e);
++        }
+     }
+ 
+     private void createNotificationChannel(@NonNull final String taskTitle, @NonNull final String taskDesc) {

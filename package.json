@@ -8,7 +8,7 @@
   "scripts": {
     "start": "react-native start --host 0.0.0.0",
     "bundle": "mkdir -p ../app/src/main/assets && react-native bundle --platform android --dev false --entry-file src/index.js --bundle-output ../app/src/main/assets/index.android.bundle --assets-dest ../app/src/main/res",
-    "postinstall": "patch-package"
+    "postinstall": "node choicely-android/scripts/apply-rn-patches.js ."
   },
   "dependencies": {
     "@d11/react-native-fast-image": "8.13.0",

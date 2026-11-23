@@ -1,0 +1,222 @@
+diff --git a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaViewAPI.java b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaViewAPI.java
+index 3bb79fe..f2fc099 100644
+--- a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaViewAPI.java
++++ b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaViewAPI.java
+@@ -13,4 +13,8 @@ public interface SkiaViewAPI {
+     void onSurfaceTextureChanged(SurfaceTexture surface, int width, int height);
+ 
+     void onSurfaceDestroyed();
++
++    // Choicely patch: the backing view became hidden or visible (see SkiaTextureView).
++    default void onSurfaceVisibilityChanged(boolean visible) {
++    }
+ }
+diff --git a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaBaseView.java b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaBaseView.java
+index f012c45..e0dbf8b 100644
+--- a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaBaseView.java
++++ b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaBaseView.java
+@@ -35,10 +35,13 @@ public abstract class SkiaBaseView extends ReactViewGroup implements SkiaViewAPI
+     public void setOpaque(boolean value) {
+         if (value && mView instanceof SkiaTextureView) {
+             removeView(mView);
++            // The removed view paused drawing; the new one pauses again if it is hidden.
++            setPaused(false);
+             mView = new SkiaSurfaceView(getContext(), this, debug);
+             addView(mView);
+         } else if (!value && mView instanceof SkiaSurfaceView) {
+             removeView(mView);
++            setPaused(false);
+             mView = new SkiaTextureView(getContext(), this, debug);
+             addView(mView);
+         }
+@@ -84,6 +87,18 @@ public abstract class SkiaBaseView extends ReactViewGroup implements SkiaViewAPI
+         surfaceDestroyed();
+     }
+ 
++    @Override
++    public void onSurfaceVisibilityChanged(boolean visible) {
++        if (!RNSkiaModule.isModuleValid()) {
++            return;
++        }
++        setPaused(!visible);
++    }
++
++    // Choicely patch: while paused the native view keeps its surface but draws nothing.
++    protected void setPaused(boolean paused) {
++    }
++
+     protected abstract void surfaceAvailable(Object surface, int width, int height, boolean opaque);
+ 
+     protected abstract void surfaceSizeChanged(Object surface, int width, int height, boolean opaque);
+diff --git a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaPictureView.java b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaPictureView.java
+index 8a8e985..52a0bb7 100644
+--- a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaPictureView.java
++++ b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaPictureView.java
+@@ -73,6 +73,9 @@ public class SkiaPictureView extends SkiaBaseView {
+ 
+     protected native void surfaceDestroyed();
+ 
++    @Override
++    protected native void setPaused(boolean paused);
++
+     protected native void setBgColor(int color);
+ 
+     protected native void setDebugMode(boolean show);
+diff --git a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaTextureView.java b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaTextureView.java
+index d776590..d3d7750 100644
+--- a/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaTextureView.java
++++ b/node_modules/@shopify/react-native-skia/android/src/main/java/com/shopify/reactnative/skia/SkiaTextureView.java
+@@ -16,6 +16,15 @@ public class SkiaTextureView extends TextureView implements TextureView.SurfaceT
+     SkiaViewAPI mApi;
+     boolean mDebug;
+ 
++    // Choicely patch (ANR in RNSkia::OpenGLWindowContext::present): frames are drawn on the
++    // main thread into this view's SurfaceTexture. While the view is hidden (app in the
++    // background, another activity on top, a hidden parent) nothing consumes those frames,
++    // and on some GPU drivers (Samsung Xclipse) a draw then blocks the main thread for good.
++    // So drawing is paused while the view is hidden and resumes, with a redraw, when it shows.
++    private boolean mAggregatedVisible = true;
++    private boolean mWindowVisible = true;
++    private boolean mPaused = false;
++
+     public SkiaTextureView(Context context, SkiaViewAPI api, boolean debug) {
+         super(context);
+         mApi = api;
+@@ -29,6 +38,30 @@ public class SkiaTextureView extends TextureView implements TextureView.SurfaceT
+         super.onLayout(changed, left, top, right, bottom);
+     }
+ 
++    @Override
++    public void onVisibilityAggregated(boolean isVisible) {
++        super.onVisibilityAggregated(isVisible);
++        mAggregatedVisible = isVisible;
++        updatePaused();
++    }
++
++    @Override
++    protected void onWindowVisibilityChanged(int visibility) {
++        super.onWindowVisibilityChanged(visibility);
++        mWindowVisible = visibility == VISIBLE;
++        updatePaused();
++    }
++
++    private void updatePaused() {
++        boolean paused = !(mAggregatedVisible && mWindowVisible);
++        if (paused == mPaused) {
++            return;
++        }
++        mPaused = paused;
++        Log.i(tag, paused ? "hidden: drawing paused" : "shown: drawing resumed");
++        mApi.onSurfaceVisibilityChanged(!paused);
++    }
++
+     @Override
+     public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surfaceTexture, int width, int height) {
+         Log.i(tag, "onSurfaceTextureAvailable:  " + width + "x" + height);
+diff --git a/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.h b/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.h
+index ca5768d..2ae7281 100644
+--- a/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.h
++++ b/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.h
+@@ -33,7 +33,11 @@ public:
+ 
+   void surfaceSizeChanged(jobject jSurface, int width, int height, bool opaque);
+ 
++  // Choicely patch: no drawing while the view is hidden (see SkiaTextureView).
++  void setPaused(bool paused);
++
+ private:
++  bool _paused = false;
+   std::unique_ptr<WindowContext> _surfaceHolder = nullptr;
+   std::shared_ptr<RNSkPlatformContext> _platformContext;
+   jobject _jSurfaceTexture = nullptr;
+diff --git a/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.cpp b/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.cpp
+index e8e4c03..745f011 100644
+--- a/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.cpp
++++ b/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkOpenGLCanvasProvider.cpp
+@@ -47,6 +47,9 @@ int RNSkOpenGLCanvasProvider::getHeight() {
+ 
+ bool RNSkOpenGLCanvasProvider::renderToCanvas(
+     const std::function<void(SkCanvas *)> &cb) {
++  if (_paused) {
++    return false;
++  }
+   if (_surfaceHolder != nullptr && cb != nullptr) {
+     // Get the surface
+     auto surface = _surfaceHolder->getSurface();
+@@ -116,6 +119,17 @@ void RNSkOpenGLCanvasProvider::surfaceAvailable(jobject jSurfaceTexture,
+   // Post redraw request to ensure we paint in the next draw cycle.
+   _requestRedraw();
+ }
++void RNSkOpenGLCanvasProvider::setPaused(bool paused) {
++  if (_paused == paused) {
++    return;
++  }
++  _paused = paused;
++  if (!paused) {
++    // Show the latest picture, including changes made while hidden.
++    _requestRedraw();
++  }
++}
++
+ void RNSkOpenGLCanvasProvider::surfaceDestroyed() {
+   // destroy the renderer (a unique pointer so the dtor will be called
+   // immediately.)
+diff --git a/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkAndroidView.h b/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkAndroidView.h
+index e0533bf..a0f9bfe 100644
+--- a/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkAndroidView.h
++++ b/node_modules/@shopify/react-native-skia/android/cpp/rnskia-android/RNSkAndroidView.h
+@@ -16,6 +16,8 @@ public:
+ 
+   virtual void surfaceDestroyed() = 0;
+ 
++  virtual void setPaused(bool paused) = 0;
++
+   virtual void surfaceSizeChanged(jobject surface, int width, int height,
+                                   bool opaque) = 0;
+ 
+@@ -46,6 +48,11 @@ public:
+         ->surfaceDestroyed();
+   }
+ 
++  void setPaused(bool paused) override {
++    std::static_pointer_cast<RNSkOpenGLCanvasProvider>(T::getCanvasProvider())
++        ->setPaused(paused);
++  }
++
+   void surfaceSizeChanged(jobject surface, int width, int height,
+                           bool opaque) override {
+     std::static_pointer_cast<RNSkOpenGLCanvasProvider>(T::getCanvasProvider())
+diff --git a/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaBaseView.h b/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaBaseView.h
+index 2bd2349..c62103e 100644
+--- a/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaBaseView.h
++++ b/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaBaseView.h
+@@ -40,6 +40,8 @@ protected:
+     _skiaAndroidView->surfaceSizeChanged(surface, width, height, opaque);
+   }
+ 
++  virtual void setPaused(bool paused) { _skiaAndroidView->setPaused(paused); }
++
+   virtual void surfaceDestroyed() { _skiaAndroidView->surfaceDestroyed(); }
+ 
+   virtual void setDebugMode(bool show) {
+diff --git a/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaPictureView.h b/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaPictureView.h
+index 616db87..e162d42 100644
+--- a/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaPictureView.h
++++ b/node_modules/@shopify/react-native-skia/android/cpp/jni/include/JniSkiaPictureView.h
+@@ -56,6 +56,7 @@ public:
+                           JniSkiaPictureView::surfaceDestroyed),
+          makeNativeMethod("surfaceSizeChanged",
+                           JniSkiaPictureView::surfaceSizeChanged),
++         makeNativeMethod("setPaused", JniSkiaPictureView::setPaused),
+          makeNativeMethod("setDebugMode", JniSkiaPictureView::setDebugMode),
+          makeNativeMethod("registerView", JniSkiaPictureView::registerView),
+          makeNativeMethod("unregisterView", JniSkiaPictureView::unregisterView),
+@@ -75,6 +76,8 @@ protected:
+ 
+   void surfaceDestroyed() override { JniSkiaBaseView::surfaceDestroyed(); }
+ 
++  void setPaused(bool paused) override { JniSkiaBaseView::setPaused(paused); }
++
+   void setDebugMode(bool show) override { JniSkiaBaseView::setDebugMode(show); }
+ 
+   void registerView(int nativeId) override {

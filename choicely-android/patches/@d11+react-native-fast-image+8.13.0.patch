@@ -1,0 +1,216 @@
+diff --git a/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewConverter.java b/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewConverter.java
+index 6cf7d8b..88a6ada 100644
+--- a/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewConverter.java
++++ b/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewConverter.java
+@@ -15,8 +15,6 @@ import com.bumptech.glide.load.model.Headers;
+ import com.bumptech.glide.load.model.LazyHeaders;
+ import com.bumptech.glide.request.RequestOptions;
+ import com.bumptech.glide.signature.ApplicationVersionSignature;
+-import com.facebook.react.bridge.JSApplicationIllegalArgumentException;
+-import com.facebook.react.bridge.NoSuchKeyException;
+ import com.facebook.react.bridge.ReadableArray;
+ import com.facebook.react.bridge.ReadableMap;
+ import com.facebook.react.bridge.ReadableMapKeySetIterator;
+@@ -35,6 +33,9 @@ class FastImageViewConverter {
+                 put("immutable", FastImageCacheControl.IMMUTABLE);
+                 put("web", FastImageCacheControl.WEB);
+                 put("cacheOnly", FastImageCacheControl.CACHE_ONLY);
++                // React Native Image's own `cache` values.
++                put("force-cache", FastImageCacheControl.IMMUTABLE);
++                put("only-if-cached", FastImageCacheControl.CACHE_ONLY);
+             }};
+ 
+     private static final Map<String, Priority> FAST_IMAGE_PRIORITY_MAP =
+@@ -50,6 +51,10 @@ class FastImageViewConverter {
+                 put("cover", ScaleType.CENTER_CROP);
+                 put("stretch", ScaleType.FIT_XY);
+                 put("center", ScaleType.CENTER_INSIDE);
++                // React Native Image's own values: both keep the image's size and only
++                // scale it down when it is larger, which is what "center" does.
++                put("repeat", ScaleType.CENTER_INSIDE);
++                put("none", ScaleType.CENTER_INSIDE);
+             }};
+ 
+     // Resolve the source uri to a file path that android understands.
+@@ -158,32 +163,31 @@ class FastImageViewConverter {
+     }
+ 
+     private static FastImageCacheControl getCacheControl(ReadableMap source) {
+-        return getValueFromSource("cache", "immutable", FAST_IMAGE_CACHE_CONTROL_MAP, source);
++        return getValueFromSource("cache", FAST_IMAGE_CACHE_CONTROL_MAP, source, "immutable", "web");
+     }
+ 
+     private static Priority getPriority(ReadableMap source) {
+-        return getValueFromSource("priority", "normal", FAST_IMAGE_PRIORITY_MAP, source);
++        return getValueFromSource("priority", FAST_IMAGE_PRIORITY_MAP, source, "normal", "normal");
+     }
+ 
+     static ScaleType getScaleType(String propValue) {
+-        return getValue("resizeMode", "cover", FAST_IMAGE_RESIZE_MODE_MAP, propValue);
++        return getValue(FAST_IMAGE_RESIZE_MODE_MAP, propValue, "cover", "cover");
+     }
+ 
+-    private static <T> T getValue(String propName, String defaultPropValue, Map<String, T> map, String propValue) {
+-        if (propValue == null) propValue = defaultPropValue;
++    // Never throws: bundles pass values this library does not know, and throwing here
++    // crashes the whole app. An absent or null value keeps `absentValue` (the library's
++    // own default, unchanged); any other unknown value falls back to `unknownValue`.
++    private static <T> T getValue(Map<String, T> map, @Nullable String propValue, String absentValue, String unknownValue) {
++        if (propValue == null) return map.get(absentValue);
+         T value = map.get(propValue);
+-        if (value == null)
+-            throw new JSApplicationIllegalArgumentException("FastImage, invalid " + propName + " : " + propValue);
+-        return value;
++        return value != null ? value : map.get(unknownValue);
+     }
+ 
+-    private static <T> T getValueFromSource(String propName, String defaultProp, Map<String, T> map, ReadableMap source) {
+-        String propValue;
+-        try {
+-            propValue = source != null ? source.getString(propName) : null;
+-        } catch (NoSuchKeyException e) {
+-            propValue = null;
++    private static <T> T getValueFromSource(String propName, Map<String, T> map, @Nullable ReadableMap source, String absentValue, String unknownValue) {
++        if (source == null || !source.hasKey(propName) || source.isNull(propName)) {
++            return map.get(absentValue);
+         }
+-        return getValue(propName, defaultProp, map, propValue);
++        String propValue = source.getType(propName) == ReadableType.String ? source.getString(propName) : "";
++        return getValue(map, propValue, absentValue, unknownValue);
+     }
+ }
+diff --git a/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewWithUrl.java b/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewWithUrl.java
+index 7036cd7..7c44056 100644
+--- a/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewWithUrl.java
++++ b/node_modules/@d11/react-native-fast-image/android/src/main/java/com/dylanvann/fastimage/FastImageViewWithUrl.java
+@@ -2,6 +2,7 @@ package com.dylanvann.fastimage;
+ 
+ import android.annotation.SuppressLint;
+ import android.content.Context;
++import android.util.DisplayMetrics;
+ import android.graphics.drawable.Drawable;
+ 
+ import androidx.annotation.Nullable;
+@@ -11,7 +12,9 @@ import androidx.appcompat.widget.AppCompatImageView;
+ import com.bumptech.glide.RequestBuilder;
+ import com.bumptech.glide.RequestManager;
+ import com.bumptech.glide.load.model.GlideUrl;
++import com.bumptech.glide.load.resource.bitmap.DownsampleStrategy;
+ import com.bumptech.glide.request.Request;
++import com.bumptech.glide.request.RequestOptions;
+ import com.bumptech.glide.load.resource.drawable.DrawableTransitionOptions;
+ import com.bumptech.glide.load.resource.gif.GifDrawable;
+ import com.facebook.react.bridge.ReadableMap;
+@@ -39,6 +42,11 @@ class FastImageViewWithUrl extends AppCompatImageView {
+     private int mBlurRadiusPrevious = 0;
+     public GlideUrl glideUrl;
+     private String mTransition = "none"; // "none" | "fade"
++    // An update that arrived before this view's first layout, run from onLayout.
++    private boolean mHasLayout = false;
++    private FastImageViewManager mPendingManager = null;
++    private RequestManager mPendingRequestManager = null;
++    private Map<String, List<FastImageViewWithUrl>> mPendingViewsForUrlsMap = null;
+ 
+     public FastImageViewWithUrl(Context context) {
+         super(context);
+@@ -81,6 +89,17 @@ class FastImageViewWithUrl extends AppCompatImageView {
+         if (!mNeedsReload)
+             return;
+ 
++        // On the new architecture props can arrive before the view is laid out. A request started
++        // now has no size, and Glide reads the 0x0 WRAP_CONTENT view as one for an image the
++        // size of the screen's longest side, centre-cropped: a 300x450 poster became a ~39 MB
++        // bitmap on a 3120 px phone. Wait for the first layout instead.
++        if (!mHasLayout) {
++            mPendingManager = manager;
++            mPendingRequestManager = requestManager;
++            mPendingViewsForUrlsMap = viewsForUrlsMap;
++            return;
++        }
++
+         if ((mSource == null ||
+                 !mSource.hasKey("uri") ||
+                 isNullOrEmpty(mSource.getString("uri"))) &&
+@@ -172,8 +191,8 @@ class FastImageViewWithUrl extends AppCompatImageView {
+             try {
+                 builder = requestManager
+                         .load(imageSource == null ? null : imageSource.getSourceForLoad())
+-                        .apply(FastImageViewConverter
+-                                .getOptions(context, imageSource, mSource, builderOptions)
++                        .apply(withLaidOutSize(FastImageViewConverter
++                                .getOptions(context, imageSource, mSource, builderOptions))
+                                 .placeholder(mDefaultSource) // show until loaded
+                                 .fallback(mDefaultSource)); // null will not be treated as error
+ 
+@@ -193,6 +212,37 @@ class FastImageViewWithUrl extends AppCompatImageView {
+         }
+     }
+ 
++    @Override
++    protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
++        super.onLayout(changed, left, top, right, bottom);
++        mHasLayout = true;
++        if (mPendingManager == null) return;
++        FastImageViewManager manager = mPendingManager;
++        RequestManager requestManager = mPendingRequestManager;
++        Map<String, List<FastImageViewWithUrl>> viewsForUrlsMap = mPendingViewsForUrlsMap;
++        mPendingManager = null;
++        mPendingRequestManager = null;
++        mPendingViewsForUrlsMap = null;
++        onAfterUpdate(manager, requestManager, viewsForUrlsMap);
++    }
++
++    // A view laid out with a size is sized by Glide from the view. A dimension laid out at 0 would
++    // still fall back to the screen's longest side, so the request gets an explicit size: the laid-out
++    // one, or the screen's for a 0 dimension, decoded no larger than the source and without the
++    // scale-type crop. The ImageView scales it when drawing, and onLoad reports the source's shape.
++    private RequestOptions withLaidOutSize(RequestOptions options) {
++        int width = getWidth();
++        int height = getHeight();
++        if (width > 0 && height > 0) return options;
++        DisplayMetrics metrics = getResources().getDisplayMetrics();
++        int screen = Math.max(metrics.widthPixels, metrics.heightPixels);
++        options = options
++                .override(width > 0 ? width : screen, height > 0 ? height : screen)
++                .downsample(DownsampleStrategy.CENTER_INSIDE);
++        // A blur keeps its transformation (it never resizes); anything else skips the crop.
++        return options.isTransformationSet() ? options : options.dontTransform();
++    }
++
+     public void clearView(@Nullable RequestManager requestManager) {
+         if (requestManager != null && getTag() != null && getTag() instanceof Request) {
+             requestManager.clear(this);
+diff --git a/node_modules/@d11/react-native-fast-image/src/FastImageViewNativeComponent.ts b/node_modules/@d11/react-native-fast-image/src/FastImageViewNativeComponent.ts
+index 572a0d0..5bf2e8d 100644
+--- a/node_modules/@d11/react-native-fast-image/src/FastImageViewNativeComponent.ts
++++ b/node_modules/@d11/react-native-fast-image/src/FastImageViewNativeComponent.ts
+@@ -8,9 +8,14 @@ import type {
+ } from 'react-native/Libraries/Types/CodegenTypes'
+ 
+ type Headers = ReadonlyArray<Readonly<{ name: string; value: string }>>
+-type Priority = WithDefault<'low' | 'normal' | 'high', 'normal'>
+-type CacheControl = WithDefault<'immutable' | 'web' | 'cacheOnly', 'web'>
+-type Transition = WithDefault<'fade' | 'none', 'none'>
++// Strings, not enums: codegen turns an enum into a C++ parser that calls abort()
++// on any other value, and bundles already pass other values (React Native
++// Image's cache 'force-cache', resizeMode 'repeat' ...). The native views map
++// each one and fall back to the default below for anything unknown.
++type Priority = WithDefault<string, 'normal'>
++type CacheControl = WithDefault<string, 'web'>
++type Transition = WithDefault<string, 'none'>
++type ResizeMode = WithDefault<string, 'cover'>
+ 
+ type FastImageSource = Readonly<{
+     uri?: string
+@@ -41,10 +46,7 @@ interface NativeProps extends ViewProps {
+     onFastImageProgress?: BubblingEventHandler<OnProgressEvent>
+     source?: FastImageSource
+     defaultSource?: string | null
+-    resizeMode?: WithDefault<
+-        'contain' | 'cover' | 'stretch' | 'center',
+-        'cover'
+-    >
++    resizeMode?: ResizeMode
+     tintColor?: ColorValue
+     blurRadius?: Int32
+     transition?: Transition

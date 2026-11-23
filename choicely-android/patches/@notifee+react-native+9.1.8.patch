@@ -1,0 +1,58 @@
+diff --git a/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/HeadlessTask.java b/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/HeadlessTask.java
+index 24d3c9d..3a856ff 100644
+--- a/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/HeadlessTask.java
++++ b/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/HeadlessTask.java
+@@ -262,9 +262,27 @@ public class HeadlessTask {
+     }
+   }
+ 
++  /**
++   * False when the app says its deferred React Native init has not run yet (a process started only
++   * for a push or a background job). Asking does not run it. Apps without the method count as
++   * initialized.
++   */
++  public static boolean isReactNativeInitialized(Context context) {
++    Context app = context.getApplicationContext();
++    try {
++      Method isInitialized = app.getClass().getMethod("isReactNativeInitialized");
++      return !Boolean.FALSE.equals(isInitialized.invoke(app));
++    } catch (Exception e) {
++      return true;
++    }
++  }
++
+   public static ReactContext getReactContext(Context context) {
++    // Asking the app for its ReactHost runs a deferred React Native init, and that init is what
++    // makes isBridgelessArchitectureEnabled() true. Check the flag before it and a background start
++    // takes the old-architecture path, which throws on a bridgeless app.
++    Object reactHost = getReactHost(context);
+     if (isBridgelessArchitectureEnabled()) {
+-      Object reactHost = getReactHost(context);
+       Assertions.assertNotNull(reactHost, "getReactHost() is null in New Architecture");
+       try {
+         Method getCurrentReactContext = reactHost.getClass().getMethod("getCurrentReactContext");
+diff --git a/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/NotifeeEventSubscriber.java b/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/NotifeeEventSubscriber.java
+index 00ecd14..e81e923 100644
+--- a/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/NotifeeEventSubscriber.java
++++ b/node_modules/@notifee/react-native/android/src/main/java/io/invertase/notifee/NotifeeEventSubscriber.java
+@@ -8,6 +8,7 @@ import static io.invertase.notifee.NotifeeReactUtils.isAppInForeground;
+ 
+ import android.os.Bundle;
+ import androidx.annotation.Keep;
++import app.notifee.core.EventSubscriber;
+ import app.notifee.core.event.BlockStateEvent;
+ import app.notifee.core.event.ForegroundServiceEvent;
+ import app.notifee.core.event.LogEvent;
+@@ -99,6 +100,12 @@ public class NotifeeEventSubscriber implements EventListener {
+       eventMap.putBoolean(KEY_HEADLESS, false);
+       NotifeeReactUtils.sendEvent(NOTIFICATION_EVENT_KEY, eventMap);
+     } else {
++      if (!HeadlessTask.isReactNativeInitialized(EventSubscriber.getContext())) {
++        // No React Native in this process, and starting it only to report a settings change costs
++        // a full background start. Finish the job so WorkManager does not rerun it.
++        blockStateEvent.setCompletionResult();
++        return;
++      }
+       eventMap.putBoolean(KEY_HEADLESS, true);
+       NotifeeReactUtils.startHeadlessTask(
+           NOTIFICATION_EVENT_KEY, eventMap, 0, blockStateEvent::setCompletionResult);
